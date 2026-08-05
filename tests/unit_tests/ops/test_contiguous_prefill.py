@@ -138,16 +138,3 @@ def test_gather_contiguous_kv_on_accelerator(device):
     )
     torch.testing.assert_close(key, expected_key)
     torch.testing.assert_close(value, expected_value)
-
-
-def test_gather_contiguous_kv_rejects_short_block_table():
-    key_cache = torch.zeros((2, 2, 1, 1))
-    value_cache = torch.zeros_like(key_cache)
-
-    with pytest.raises(ValueError, match="requires 2"):
-        gather_contiguous_kv(
-            key_cache,
-            value_cache,
-            torch.tensor([0]),
-            seq_len=3,
-        )

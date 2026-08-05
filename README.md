@@ -186,16 +186,3 @@ If you want to use the original CUDA operators, you can set the following enviro
 ```sh
 export USE_FLAGGEMS=0
 ```
-
-### MetaX contiguous single-request prefill
-
-For long-context workloads where a scheduler step contains one prefill
-request, the MetaX attention backend can gather paged K/V blocks once and run
-FlashAttention on contiguous K/V tensors:
-
-```sh
-export VLLM_FL_METAX_CONTIGUOUS_SINGLE_PREFILL=1
-```
-
-The optimization is disabled by default. Multi-request prefill and FP8 KV
-cache continue to use the paged attention path.

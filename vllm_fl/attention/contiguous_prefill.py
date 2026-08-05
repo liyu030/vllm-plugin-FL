@@ -33,23 +33,8 @@ def gather_contiguous_kv(
     seq_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Gather one paged KV sequence into token-contiguous tensors."""
-    if key_cache.ndim != 4 or value_cache.ndim != 4:
-        raise ValueError("KV cache tensors must have shape [blocks, block, heads, dim]")
-    if key_cache.shape != value_cache.shape:
-        raise ValueError("Key and value caches must have identical shapes")
-    if block_table.ndim != 1:
-        raise ValueError("The block table for one sequence must be one-dimensional")
-    if seq_len <= 0:
-        raise ValueError("Sequence length must be positive")
-
     block_size = key_cache.shape[1]
     num_blocks = (seq_len + block_size - 1) // block_size
-    if block_table.numel() < num_blocks:
-        raise ValueError(
-            f"Block table has {block_table.numel()} entries, "
-            f"but sequence length {seq_len} requires {num_blocks}"
-        )
-
     block_ids = block_table[:num_blocks]
     contiguous_key = torch.index_select(key_cache, 0, block_ids)
     contiguous_value = torch.index_select(value_cache, 0, block_ids)
