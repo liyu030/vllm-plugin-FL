@@ -9,6 +9,12 @@ from typing import ClassVar
 import numpy as np
 import torch
 
+from vllm_fl import envs as fl_envs
+from vllm_fl.attention.contiguous_prefill import (
+    can_use_contiguous_single_prefill,
+    gather_contiguous_kv,
+)
+
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
@@ -29,7 +35,6 @@ from .utils.fa_utils import (
     get_flash_attn_version,
     is_flash_attn_varlen_func_available,
 )
-
 if is_flash_attn_varlen_func_available():
     from .utils.fa_utils import (
         flash_attn_supports_sinks,
@@ -656,6 +661,9 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         self.sinks = sinks
+        self.contiguous_single_prefill = (
+            fl_envs.VLLM_FL_METAX_CONTIGUOUS_SINGLE_PREFILL
+        )
         if self.sinks is not None:
             assert flash_attn_supports_sinks(), (
                 "Sinks are only supported in FlashAttention 3"
@@ -798,13 +806,44 @@ class FlashAttentionImpl(AttentionImpl):
                 # For handling prefill decode split
                 num_decode_tokens = attn_metadata.num_decode_tokens
                 if attn_metadata.num_prefills > 0:
+                    prefill_seq_lens = attn_metadata.prefill_seq_lens.tolist()
                     cu_prefix_kv_lens = torch.tensor(
-                        [0] + attn_metadata.prefill_seq_lens.tolist(),
+                        [0] + prefill_seq_lens,
                         device=attn_metadata.prefill_seq_lens.device,
                         dtype=torch.int32,
                     ).cumsum(dim=0, dtype=torch.int32)
-                    output[num_decode_tokens:num_actual_tokens] = (
-                        flash_attn_varlen_func(
+                    if can_use_contiguous_single_prefill(
+                        self.contiguous_single_prefill,
+                        attn_metadata.num_prefills,
+                        self.kv_cache_dtype,
+                    ):
+                        contiguous_key, contiguous_value = gather_contiguous_kv(
+                            key_cache,
+                            value_cache,
+                            attn_metadata.prefill_block_table[0],
+                            prefill_seq_lens[0],
+                        )
+                        logger.info_once(
+                            "Using contiguous KV for single-request prefill "
+                            "FlashAttention."
+                        )
+                        prefill_output = flash_attn_varlen_func(
+                            q=query[num_decode_tokens:num_actual_tokens],
+                            k=contiguous_key,
+                            v=contiguous_value,
+                            cu_seqlens_q=attn_metadata.prefill_query_start_loc,
+                            cu_seqlens_k=cu_prefix_kv_lens,
+                            max_seqlen_q=attn_metadata.max_query_len,
+                            max_seqlen_k=attn_metadata.prefill_max_seq_len,
+                            softmax_scale=self.scale,
+                            causal=attn_metadata.causal,
+                            window_size=self.sliding_window,
+                            alibi_slopes=self.alibi_slopes,
+                            softcap=self.logits_soft_cap,
+                            s_aux=self.sinks,
+                        )
+                    else:
+                        prefill_output = flash_attn_varlen_func(
                             q=query[num_decode_tokens:num_actual_tokens],
                             k=key_cache,
                             v=value_cache,
@@ -820,7 +859,7 @@ class FlashAttentionImpl(AttentionImpl):
                             softcap=self.logits_soft_cap,
                             s_aux=self.sinks,
                         )
-                    )
+                    output[num_decode_tokens:num_actual_tokens] = prefill_output
                 if attn_metadata.num_decodes > 0:
                     # Use flash_attn_with_kvcache for normal decoding.
                     decode_query = query[:num_decode_tokens]
