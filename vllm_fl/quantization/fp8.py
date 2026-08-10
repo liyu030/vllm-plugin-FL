@@ -12,30 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import ClassVar
 import torch
-
-from vllm.utils.torch_utils import direct_register_custom_op
-
-from vllm.model_executor.kernels.linear.scaled_mm.BlockScaledMMLinearKernel import (
-    Fp8BlockScaledDynamicMMLinearKernel,
-    Fp8BlockScaledMMLinearKernel,
-)
-from vllm.model_executor.kernels.linear.scaled_mm.flashinfer import (
-    FlashInferFp8DeepGEMMDynamicBlockScaledKernel,
-)
-from vllm.model_executor.kernels.linear.scaled_mm.BlockScaledMMLinearKernel import (
-    Fp8BlockScaledDynamicMMLinearKernel,
-    Fp8BlockScaledMMLinearKernel,
-)
-from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
-    FP8ScaledMMLinearKernel,
-    FP8ScaledMMLinearLayerConfig,
-)
-from vllm.model_executor.kernels.linear.scaled_mm.deep_gemm import DeepGemmFp8BlockScaledMMKernel
-from vllm.model_executor.utils import replace_parameter
+from vllm.platforms import current_platform
 
 from flag_gems import w8a8_block_fp8_matmul
+from vllm_fl.ops.metax_quant import metax_fp8_block_gemm
+from vllm.model_executor.kernels.linear.scaled_mm.BlockScaledMMLinearKernel import (
+    Fp8BlockScaledMMLinearKernel,
+)
+from vllm.model_executor.utils import replace_parameter
+from vllm.utils.torch_utils import direct_register_custom_op
+
 
 def _flaggems_fp8_block_gemm_impl(
         input: torch.Tensor,
@@ -45,20 +32,31 @@ def _flaggems_fp8_block_gemm_impl(
         block_size: list[int],
         output_dtype: torch.dtype,
 ) -> torch.Tensor:
-    return w8a8_block_fp8_matmul(input, weight, input_scale, weight_scale, block_size, output_dtype=output_dtype)
-
-class FlagGemsFp8BlockScaledMMLinearKernel(Fp8BlockScaledDynamicMMLinearKernel):
-    base_type: ClassVar[type[FlashInferFp8DeepGEMMDynamicBlockScaledKernel]] = (
-        FlashInferFp8DeepGEMMDynamicBlockScaledKernel
+    if current_platform.vendor_name == "metax":
+        return metax_fp8_block_gemm(
+            input,
+            weight,
+            input_scale,
+            weight_scale,
+            block_size,
+            output_dtype,
+        )
+    return w8a8_block_fp8_matmul(
+        input,
+        weight,
+        input_scale,
+        weight_scale,
+        block_size,
+        output_dtype=output_dtype,
     )
-    fallback_type: ClassVar[type[DeepGemmFp8BlockScaledMMKernel]] = (
-        DeepGemmFp8BlockScaledMMKernel
-    )
 
-    def __init__(self, config: FP8ScaledMMLinearLayerConfig):
-        super().__init__(config)
-        self.base: FlashInferFp8DeepGEMMDynamicBlockScaledKernel
-        self.fallback: DeepGemmFp8BlockScaledMMKernel
+
+class FlagGemsFp8BlockScaledMMLinearKernel(Fp8BlockScaledMMLinearKernel):
+    @classmethod
+    def is_supported(
+        cls, compute_capability: int | None = None
+    ) -> tuple[bool, str | None]:
+        return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
         # FlagGems not support float8_e8m0
@@ -88,8 +86,7 @@ class FlagGemsFp8BlockScaledMMLinearKernel(Fp8BlockScaledDynamicMMLinearKernel):
             new_weight_scale = exp_bits.view(torch.float32)
         else:
             new_weight_scale = weight_scale
-        replace_parameter(layer, scale_attr_name, new_weight_scale.data) 
-
+        replace_parameter(layer, scale_attr_name, new_weight_scale.data)
 
     def apply_block_scaled_mm(
         self,
@@ -100,7 +97,15 @@ class FlagGemsFp8BlockScaledMMLinearKernel(Fp8BlockScaledDynamicMMLinearKernel):
     ) -> torch.Tensor:
         weight_group_shape = self.config.weight_quant_key.scale.group_shape
         group_shape = [weight_group_shape.row, weight_group_shape.col]
-        return torch.ops.vllm.flaggems_fp8_block_gemm(A, B, As, Bs, group_shape, output_dtype=self.config.out_dtype)
+        return torch.ops.vllm.flaggems_fp8_block_gemm(
+            A,
+            B,
+            As,
+            Bs,
+            group_shape,
+            output_dtype=self.config.out_dtype,
+        )
+
 
 def _flaggems_fp8_block_gemm_fake(
     input: torch.Tensor,
@@ -108,13 +113,16 @@ def _flaggems_fp8_block_gemm_fake(
     input_scale: torch.Tensor,
     weight_scale: torch.Tensor,
     block_size: list[int],
-    output_dtype: torch.dtype
+    output_dtype: torch.dtype,
 ) -> torch.Tensor:
     """
     Required fake/meta implementation for torch.compile graph tracing.
     """
     return torch.empty(
-            input.shape[0], weight.shape[0], dtype=output_dtype, device=input.device
+        input.shape[0],
+        weight.shape[0],
+        dtype=output_dtype,
+        device=input.device,
     )
 
 direct_register_custom_op(

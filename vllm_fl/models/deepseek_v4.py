@@ -69,10 +69,6 @@ from vllm.model_executor.models.utils import (
 from vllm_fl.ops.deepseek_v4_attention import (
     DeepseekV4Indexer as DeepseekV4IndexerFP8,
 )
-from vllm_fl.ops.deepseek_v4_attention_bf16 import (
-    DeepseekV4Indexer as DeepseekV4IndexerBF16,
-    DeepseekV4MultiHeadLatentAttentionBF16Wrapper,
-)
 
 _DEEPSEEK_V4_EXPERT_DTYPES = ("bf16", "fp4", "fp8")
 
@@ -157,7 +153,7 @@ class WOAColumnParallelLinear(ColumnParallelLinear):
 
         def _process_weights_after_loading(layer):
             orig_fn(layer)
-            if not getattr(layer, "is_bmm", False):
+            if layer.weight.dtype != torch.float8_e4m3fn:
                 return
             w = layer.weight
             if w.ndim != 2:
@@ -165,26 +161,12 @@ class WOAColumnParallelLinear(ColumnParallelLinear):
                 return
 
             g = layer.bmm_batch_size
-            ws = getattr(layer, "weight_scale_inv", None)
-            scale_attr = "weight_scale_inv"
-            if ws is None:
-                ws = getattr(layer, "weight_scale", None)
-                scale_attr = "weight_scale"
-            if ws is None:
-                # Unquantized BF16 wo_a still needs the grouped-BMM weight
-                # layout, but has no FP8 scale tensor to post-process.
-                replace_parameter(
-                    layer,
-                    "weight",
-                    w.view(g, w.size(0) // g, w.size(1)),
-                )
-                return
-
-            block_size = getattr(layer, "weight_block_size", [128, 128])
+            ws = layer.weight_scale_inv
+            block_size = layer.weight_block_size
             candidates = get_default_manager().resolve_candidates(
                 "deepseek_v4_fp8_einsum"
             )
-            use_flaggems = (
+            use_flaggems = current_platform.vendor_name == "metax" or (
                 candidates[0].kind == BackendImplKind.DEFAULT
                 and candidates[0].impl_id == "default.flagos"
             )
@@ -213,7 +195,7 @@ class WOAColumnParallelLinear(ColumnParallelLinear):
                 )
                 processed_weight, processed_scale = dg_weight, dg_scale
             replace_parameter(layer, "weight", processed_weight)
-            replace_parameter(layer, scale_attr, processed_scale)
+            replace_parameter(layer, "weight_scale_inv", processed_scale)
 
         self.quant_method.process_weights_after_loading = (
             _process_weights_after_loading
@@ -1193,11 +1175,12 @@ class DeepseekV4Attention(nn.Module):
         self.indexer = None
         if self.compress_ratio == 4:
             # Only C4A uses sparse attention and hence has indexer.
-            indexer_cls = (
-                DeepseekV4IndexerBF16
-                if getattr(config, "expert_dtype", "fp4") == "bf16"
-                else DeepseekV4IndexerFP8
-            )
+            if config.expert_dtype == "bf16":
+                from vllm_fl.ops.deepseek_v4_attention_bf16 import (
+                    DeepseekV4Indexer as indexer_cls,
+                )
+            else:
+                indexer_cls = DeepseekV4IndexerFP8
             self.indexer = indexer_cls(
                 vllm_config,
                 config=config,
@@ -1230,11 +1213,12 @@ class DeepseekV4Attention(nn.Module):
         use_bf16_attention = isinstance(
             self.wo_a.quant_method, UnquantizedLinearMethod
         )
-        attention_wrapper_cls = (
-            DeepseekV4MultiHeadLatentAttentionBF16Wrapper
-            if use_bf16_attention
-            else DeepseekV4MultiHeadLatentAttentionWrapper
-        )
+        if use_bf16_attention:
+            from vllm_fl.ops.deepseek_v4_attention_bf16 import (
+                DeepseekV4MultiHeadLatentAttentionBF16Wrapper as attention_wrapper_cls,
+            )
+        else:
+            attention_wrapper_cls = DeepseekV4MultiHeadLatentAttentionWrapper
         self.mla_attn = attention_wrapper_cls(
             hidden_size=self.hidden_size,
             num_heads=self.n_local_heads,
@@ -1273,9 +1257,10 @@ class DeepseekV4DecoderLayer(nn.Module):
     ):
         super().__init__()
 
-        # Lazy import to avoid top-level tilelang dependency.
-        # Registers both torch.ops.vllm.mhc_pre and mhc_post
-        import vllm.model_executor.layers.mhc  # noqa: F401
+        # MetaX uses the FlagGems implementations registered through CachedOp.
+        # Other backends retain vLLM's TileLang fallback registration.
+        if current_platform.vendor_name != "metax":
+            import vllm.model_executor.layers.mhc  # noqa: F401
 
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
