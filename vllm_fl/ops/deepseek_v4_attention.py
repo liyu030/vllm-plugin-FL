@@ -197,6 +197,7 @@ class DeepseekV4MultiHeadLatentAttentionFLWrapper(DeepseekV4MultiHeadLatentAtten
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
+        assert cache_config is not None
         use_int8_cache = cache_config.cache_dtype == _INT8_KV_DTYPE
         self.use_int8_kv_cache = use_int8_cache
         if use_int8_cache:
@@ -890,6 +891,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 ((num_decode_tokens, total_width), torch.int32),
             )
             if extra_width:
+                assert kv_cache is not None
                 gather_int8_cache_indices(
                     kv_cache,
                     main_indices,
@@ -1156,6 +1158,7 @@ class DeepseekV4Indexer(nn.Module):
         self.q_lora_rank = q_lora_rank  # 1536
         self.compress_ratio = compress_ratio
         self.use_fp4_kv = self.vllm_config.attention_config.use_fp4_indexer_cache
+        assert cache_config is not None, "Deepseek V4 indexer requires cache_config"
         self.use_int8_kv = cache_config.cache_dtype == _INT8_KV_DTYPE
         logger.info_once(
             "Using %s indexer cache for Lighening Indexer.",

@@ -36,12 +36,6 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
 )
-from vllm_fl.ops.deepseek_v4_int8_kv import (
-    fused_compress_rope_int8_mla_cache_kernel,
-)
-from vllm_fl.ops.deepseek_v4_int8_indexer import (
-    fused_compress_rope_int8_indexer_cache_kernel,
-)
 from vllm_fl.dispatch.backends.vendor.cuda.impl.deepseek_v4_ops.fused_compress import (
     _fused_kv_compress_norm_rope_insert_sparse_attn_bf16,
     _fused_kv_compress_norm_rope_insert_indexer_attn_bf16,
@@ -204,11 +198,6 @@ class DeepseekCompressor(nn.Module):
         self.k_cache_prefix = k_cache_prefix
         self.quant_config = vllm_config.quant_config
         self.use_fp4_cache = use_fp4_cache
-        requested_int8 = (
-            vllm_config.cache_config.cache_dtype == "int8_per_token_head"
-        )
-        self.use_int8_kv_cache = head_dim == 512 and requested_int8
-        self.use_int8_indexer_cache = head_dim == 128 and requested_int8
 
         config = vllm_config.model_config.hf_config
         self.rope_head_dim = config.qk_rope_head_dim

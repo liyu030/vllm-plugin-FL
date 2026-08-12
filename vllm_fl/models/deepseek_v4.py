@@ -245,7 +245,7 @@ class WOAColumnParallelLinear(ColumnParallelLinear):
 
         def _process_weights_after_loading(layer):
             orig_fn(layer)
-            if layer.weight.dtype != torch.float8_e4m3fn:
+            if not getattr(layer, "is_bmm", False):
                 return
             w = layer.weight
             if w.ndim != 2:
@@ -253,8 +253,20 @@ class WOAColumnParallelLinear(ColumnParallelLinear):
                 return
 
             g = layer.bmm_batch_size
-            ws = layer.weight_scale_inv
-            block_size = layer.weight_block_size
+            ws = getattr(layer, "weight_scale_inv", None)
+            scale_attr = "weight_scale_inv"
+            if ws is None:
+                ws = getattr(layer, "weight_scale", None)
+                scale_attr = "weight_scale"
+            if ws is None:
+                replace_parameter(
+                    layer,
+                    "weight",
+                    w.view(g, w.size(0) // g, w.size(1)),
+                )
+                return
+
+            block_size = getattr(layer, "weight_block_size", [128, 128])
             candidates = get_default_manager().resolve_candidates(
                 "deepseek_v4_fp8_einsum"
             )
@@ -287,7 +299,7 @@ class WOAColumnParallelLinear(ColumnParallelLinear):
                 )
                 processed_weight, processed_scale = dg_weight, dg_scale
             replace_parameter(layer, "weight", processed_weight)
-            replace_parameter(layer, "weight_scale_inv", processed_scale)
+            replace_parameter(layer, scale_attr, processed_scale)
 
         self.quant_method.process_weights_after_loading = (
             _process_weights_after_loading
@@ -1799,6 +1811,18 @@ class DeepseekV4ForCausalLM(nn.Module):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
+        if (
+            current_platform.vendor_name == "metax"
+            and quant_config is not None
+            and quant_config.get_name() == "deepseek_v4_fp8"
+        ):
+            vllm_config.quant_config = DeepseekV4FP8Config(
+                quant_config.is_checkpoint_fp8_serialized,
+                quant_config.activation_scheme,
+                quant_config.ignored_layers,
+                quant_config.weight_block_size,
+            )
         self.config = config
         expert_dtype = getattr(config, "expert_dtype", "fp4")
         if expert_dtype != "fp4":

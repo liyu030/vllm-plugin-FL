@@ -5,11 +5,14 @@
 import torch
 
 import vllm.envs as envs
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
+    has_deep_gemm,
 )
 from vllm.utils.torch_utils import (
     LayerNameType,
@@ -35,6 +38,8 @@ _top_k_per_row_prefill = CachedOp("top_k_per_row_prefill")
 _pack_seq_triton = CachedOp("pack_seq_triton")
 _top_k_per_row_decode = CachedOp("top_k_per_row_decode")
 _unpack_seq_triton = CachedOp("unpack_seq_triton")
+
+logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
@@ -89,7 +94,7 @@ def kv_cache_as_quant_view(
     return kv_cache.unsqueeze(-2)
 
 
-def _sparse_attn_indexer_dispatch_impl(
+def sparse_attn_indexer_fl(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,
     kv_cache: torch.Tensor,
@@ -117,11 +122,7 @@ def _sparse_attn_indexer_dispatch_impl(
     if not isinstance(attn_metadata, dict):
         # Reserve workspace for indexer during profiling run
         values_spec, scales_spec = _gather_workspace_shapes(
-            total_seq_lens,
-            head_dim,
-            fp8_dtype,
-            use_fp4_cache,
-            use_int8_cache,
+            total_seq_lens, head_dim, fp8_dtype, use_fp4_cache, use_int8_cache
         )
         current_workspace_manager().get_simultaneous(
             values_spec,
@@ -136,7 +137,24 @@ def _sparse_attn_indexer_dispatch_impl(
             max_logits_elems, dtype=torch.uint8, device=hidden_states.device
         )
 
-        return topk_indices_buffer
+        return sparse_attn_indexer_fl_fake(
+            hidden_states,
+            k_cache_prefix,
+            kv_cache,
+            q_quant,
+            q_scale,
+            k,
+            weights,
+            quant_block_size,
+            scale_fmt,
+            topk_tokens,
+            head_dim,
+            max_model_len,
+            total_seq_lens,
+            topk_indices_buffer,
+            skip_k_cache_insert,
+            use_fp4_cache,
+        )
     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
     assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
     slot_mapping = attn_metadata_narrowed.slot_mapping
@@ -181,11 +199,7 @@ def _sparse_attn_indexer_dispatch_impl(
         # scales) based on use_fp4_cache.
         workspace_manager = current_workspace_manager()
         values_spec, scales_spec = _gather_workspace_shapes(
-            total_seq_lens,
-            head_dim,
-            fp8_dtype,
-            use_fp4_cache,
-            use_int8_cache,
+            total_seq_lens, head_dim, fp8_dtype, use_fp4_cache, use_int8_cache
         )
         k_quant_full, k_scale_full = workspace_manager.get_simultaneous(
             values_spec,
@@ -224,8 +238,8 @@ def _sparse_attn_indexer_dispatch_impl(
             ### TODO(lms) replace
             if use_int8_cache:
                 logits = int8_mqa_logits(
-                    q_slice_cast,
-                    k_quant_cast,
+                    q_slice,
+                    k_quant,
                     k_scale_cast,
                     weights[chunk.token_start : chunk.token_end],
                     chunk.cu_seqlen_ks,
@@ -261,9 +275,7 @@ def _sparse_attn_indexer_dispatch_impl(
         decode_metadata = attn_metadata_narrowed.decode
         assert decode_metadata is not None
         if not use_int8_cache:
-            kv_cache = kv_cache_as_quant_view(
-                kv_cache, head_dim, use_fp4_cache
-            )
+            kv_cache = kv_cache_as_quant_view(kv_cache, head_dim, use_fp4_cache)
         decode_lens = decode_metadata.decode_lens
         if decode_metadata.requires_padding:
             # pad in edge case where we have short chunked prefill length <
@@ -335,15 +347,40 @@ def _sparse_attn_indexer_dispatch_impl(
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
         _top_k_per_row_decode(
-            logits,
-            next_n,
-            seq_lens,
-            topk_indices,
-            num_rows,
-            logits.stride(0),
-            logits.stride(1),
-            topk_tokens,
-        )
+                logits,
+                next_n,
+                seq_lens,
+                topk_indices,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+                topk_tokens,
+            )
+
+        # if current_platform.is_cuda() and topk_tokens in (512, 1024, 2048):
+        #     workspace_manager = current_workspace_manager()
+        #     (topk_workspace,) = workspace_manager.get_simultaneous(
+        #         ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+        #     )
+        #     torch.ops._C.persistent_topk(
+        #         logits,
+        #         seq_lens,
+        #         topk_indices,
+        #         topk_workspace,
+        #         topk_tokens,
+        #         attn_metadata_narrowed.max_seq_len,
+        #     )
+        # else:
+        #     torch.ops._C.top_k_per_row_decode(
+        #         logits,
+        #         next_n,
+        #         seq_lens,
+        #         topk_indices,
+        #         num_rows,
+        #         logits.stride(0),
+        #         logits.stride(1),
+        #         topk_tokens,
+        #     )
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
@@ -357,114 +394,6 @@ def _sparse_attn_indexer_dispatch_impl(
             )
 
     return topk_indices_buffer
-
-
-def sparse_attn_indexer_int8(
-    hidden_states: torch.Tensor,
-    k_cache_prefix: LayerNameType,
-    kv_cache: torch.Tensor,
-    q_int8: torch.Tensor,
-    k: torch.Tensor,
-    weights: torch.Tensor,
-    quant_block_size: int,
-    scale_fmt: str | None,
-    topk_tokens: int,
-    head_dim: int,
-    max_model_len: int,
-    total_seq_lens: int,
-    topk_indices_buffer: torch.Tensor,
-    skip_k_cache_insert: bool,
-) -> torch.Tensor:
-    """Registered vLLM custom op for the direct INT8 indexer path."""
-    return _sparse_attn_indexer_dispatch_impl(
-        hidden_states,
-        k_cache_prefix,
-        kv_cache,
-        q_int8,
-        None,
-        k,
-        weights,
-        quant_block_size,
-        scale_fmt,
-        topk_tokens,
-        head_dim,
-        max_model_len,
-        total_seq_lens,
-        topk_indices_buffer,
-        skip_k_cache_insert,
-        False,
-    )
-
-
-def sparse_attn_indexer_int8_fake(
-    hidden_states: torch.Tensor,
-    k_cache_prefix: LayerNameType,
-    kv_cache: torch.Tensor,
-    q_int8: torch.Tensor,
-    k: torch.Tensor,
-    weights: torch.Tensor,
-    quant_block_size: int,
-    scale_fmt: str | None,
-    topk_tokens: int,
-    head_dim: int,
-    max_model_len: int,
-    total_seq_lens: int,
-    topk_indices_buffer: torch.Tensor,
-    skip_k_cache_insert: bool,
-) -> torch.Tensor:
-    return topk_indices_buffer
-
-
-direct_register_custom_op(
-    op_name="sparse_attn_indexer_int8",
-    op_func=sparse_attn_indexer_int8,
-    mutates_args=["topk_indices_buffer"],
-    fake_impl=sparse_attn_indexer_int8_fake,
-    dispatch_key=current_platform.dispatch_key,
-)
-
-
-def sparse_attn_indexer_fl(
-    hidden_states: torch.Tensor,
-    k_cache_prefix: LayerNameType,
-    kv_cache: torch.Tensor,
-    q_quant: torch.Tensor,
-    q_scale: torch.Tensor | None,
-    k: torch.Tensor,
-    weights: torch.Tensor,
-    quant_block_size: int,
-    scale_fmt: str | None,
-    topk_tokens: int,
-    head_dim: int,
-    max_model_len: int,
-    total_seq_lens: int,
-    topk_indices_buffer: torch.Tensor,
-    skip_k_cache_insert: bool,
-    use_fp4_cache: bool = False,
-) -> torch.Tensor:
-    """FL-dispatched FP8/FP4 indexer implementation.
-
-    Keep the upstream SparseAttnIndexer interface, while routing cache,
-    gather, packing and TopK helpers through vllm_fl.dispatch.CachedOp.
-    """
-    return _sparse_attn_indexer_dispatch_impl(
-        hidden_states,
-        k_cache_prefix,
-        kv_cache,
-        q_quant,
-        q_scale,
-        k,
-        weights,
-        quant_block_size,
-        scale_fmt,
-        topk_tokens,
-        head_dim,
-        max_model_len,
-        total_seq_lens,
-        topk_indices_buffer,
-        skip_k_cache_insert,
-        use_fp4_cache,
-    )
 
 
 def sparse_attn_indexer_fl_fake(
@@ -481,7 +410,7 @@ def sparse_attn_indexer_fl_fake(
     head_dim: int,
     max_model_len: int,
     total_seq_lens: int,
-    topk_indices_buffer: torch.Tensor,
+    topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool,
     use_fp4_cache: bool = False,
 ) -> torch.Tensor:
@@ -498,7 +427,45 @@ direct_register_custom_op(
 
 
 class SparseAttnIndexerFL(SparseAttnIndexer):
-    """Unified Python layer for FL-dispatched FP8/FP4 and direct INT8."""
+    """Sparse Attention Indexer Custom Op Layer. This layer is extracted as a
+    separate custom op since it involves heavy custom kernels like `mqa_logits`,
+    `paged_mqa_logits` and `top_k_per_row`, etc. Those kernels maybe requires
+    specific memory layout or implementation for different hardware backends to
+    achieve optimal performance.
+
+    For now, the default native path will use CUDA backend path. Other platform
+    may requires add the corresponding Custom Op name `sparse_attn_indexer` to
+    `custom_ops` in `CompilationConfig` to enable the platform specific path.
+    """
+
+    # def __init__(
+    #     self,
+    #     k_cache,
+    #     quant_block_size: int,
+    #     scale_fmt: str,
+    #     topk_tokens: int,
+    #     head_dim: int,
+    #     max_model_len: int,
+    #     max_total_seq_len: int,
+    #     topk_indices_buffer: torch.Tensor,
+    #     skip_k_cache_insert: bool = False,
+    #     use_fp4_cache: bool = False,
+    # ):
+    #     super().__init__()
+    #     self.k_cache = k_cache
+    #     self.quant_block_size = quant_block_size
+    #     self.scale_fmt = scale_fmt
+    #     self.topk_tokens = topk_tokens
+    #     self.head_dim = head_dim
+    #     self.max_model_len = max_model_len
+    #     self.max_total_seq_len = max_total_seq_len
+    #     self.topk_indices_buffer = topk_indices_buffer
+    #     self.skip_k_cache_insert = skip_k_cache_insert
+    #     self.use_fp4_cache = use_fp4_cache
+    #     if current_platform.is_cuda() and not has_deep_gemm():
+    #         raise RuntimeError(
+    #             "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
+    #         )
 
     def forward_native(
         self,
@@ -516,27 +483,12 @@ class SparseAttnIndexerFL(SparseAttnIndexer):
         k: torch.Tensor,
         weights: torch.Tensor,
     ):
+        # FP8 path: single tensor (per-token scale is folded into `weights`).
+        # FP4 path: (values, scales) tuple with scales required by the kernel.
         if isinstance(q_quant, tuple):
             q_values, q_scale = q_quant
         else:
             q_values, q_scale = q_quant, None
-        if q_values.dtype == torch.int8:
-            return torch.ops.vllm.sparse_attn_indexer_int8(
-                hidden_states,
-                _encode_layer_name(self.k_cache.prefix),
-                self.k_cache.kv_cache,
-                q_values,
-                k,
-                weights,
-                self.quant_block_size,
-                self.scale_fmt,
-                self.topk_tokens,
-                self.head_dim,
-                self.max_model_len,
-                self.max_total_seq_len,
-                self.topk_indices_buffer,
-                self.skip_k_cache_insert,
-            )
         return torch.ops.vllm.sparse_attn_indexer_fl(
             hidden_states,
             _encode_layer_name(self.k_cache.prefix),

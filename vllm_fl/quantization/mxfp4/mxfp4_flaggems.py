@@ -226,7 +226,7 @@ class FlagGemsMxfp4MoEMethod(Mxfp4MoEMethod):
             moe_quant_config=self.moe_quant_config,
             moe_config=self.moe,
             mxfp4_backend=Mxfp4MoeBackend.MARLIN,
-            experts_cls=FlagGemsMxfp4Experts,
+            experts_cls=self.experts_cls,
             routing_tables=layer._maybe_init_expert_routing_tables(),
             shared_experts=layer.shared_experts,
         )
@@ -247,31 +247,6 @@ class MetaXDeepseekV4Mxfp4MoEMethod(FlagGemsMxfp4MoEMethod):
         self.w13_precision_config = None
         self.w2_precision_config = None
 
-    def _setup_kernel(
-        self,
-        layer,
-        w13,
-        w2,
-        w13_scale,
-        w2_scale,
-        w13_bias=None,
-        w2_bias=None,
-    ) -> None:
-        self.moe_quant_config = mxfp4_w4a16_moe_quant_config(
-            w1_scale=w13_scale,
-            w2_scale=w2_scale,
-            w1_bias=w13_bias,
-            w2_bias=w2_bias,
-            gemm1_clamp_limit=getattr(layer, "swiglu_limit", None),
-        )
-        self.moe_kernel = make_mxfp4_moe_kernel(
-            moe_quant_config=self.moe_quant_config,
-            moe_config=self.moe,
-            mxfp4_backend=Mxfp4MoeBackend.MARLIN,
-            experts_cls=MetaXDeepseekV4Mxfp4Experts,
-            routing_tables=layer._maybe_init_expert_routing_tables(),
-            shared_experts=layer.shared_experts,
-        )
 
 def flaggems_mxfp4_compatible(moe: FusedMoEConfig) -> bool:
     return (

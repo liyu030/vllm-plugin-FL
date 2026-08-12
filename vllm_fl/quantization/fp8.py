@@ -88,7 +88,7 @@ class FlagGemsFp8BlockScaledMMLinearKernel(Fp8BlockScaledDynamicMMLinearKernel):
             new_weight_scale = exp_bits.view(torch.float32)
         else:
             new_weight_scale = weight_scale
-        replace_parameter(layer, scale_attr_name, new_weight_scale.data)
+        replace_parameter(layer, scale_attr_name, new_weight_scale.data) 
 
 
     def apply_block_scaled_mm(
