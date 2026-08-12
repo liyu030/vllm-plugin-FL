@@ -64,7 +64,7 @@ def add_oot_quant_kernel() -> None:
         )
 
     if (
-        (current_platform.supports_fp8() or current_platform.vendor_name == "metax")
+        current_platform.supports_fp8()
         and use_flaggems_op(FLAGGEMS_FP8_BLOCK_GEMM_OP)
         and FlagGemsFp8BlockScaledMMLinearKernel
         not in _POSSIBLE_FP8_BLOCK_KERNELS[PlatformEnum.OOT]

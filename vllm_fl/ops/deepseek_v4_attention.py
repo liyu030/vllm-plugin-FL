@@ -197,7 +197,6 @@ class DeepseekV4MultiHeadLatentAttentionFLWrapper(DeepseekV4MultiHeadLatentAtten
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        assert cache_config is not None
         use_int8_cache = cache_config.cache_dtype == _INT8_KV_DTYPE
         self.use_int8_kv_cache = use_int8_cache
         if use_int8_cache:
@@ -280,8 +279,6 @@ class DeepseekV4MultiHeadLatentAttentionFLWrapper(DeepseekV4MultiHeadLatentAtten
         # HACK
         self.layer_name = prefix + ".deepseek_v4_multi_head_latent_attention"
         compilation_config.static_forward_context.pop(self.layer_name)
-        if self.layer_name in compilation_config.static_forward_context:
-            raise ValueError(f"Duplicate layer name: {self.layer_name}")
         compilation_config.static_forward_context[self.layer_name] = self
 
     def forward(
@@ -746,8 +743,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         # Register with compilation context for metadata lookup
         compilation_config = vllm_config.compilation_config
         compilation_config.static_forward_context.pop(prefix)
-        if prefix and prefix in compilation_config.static_forward_context:
-            raise ValueError(f"Duplicate layer name: {prefix}")
         if prefix:
             compilation_config.static_forward_context[prefix] = self
 
@@ -895,7 +890,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 ((num_decode_tokens, total_width), torch.int32),
             )
             if extra_width:
-                assert kv_cache is not None
                 gather_int8_cache_indices(
                     kv_cache,
                     main_indices,
@@ -1162,10 +1156,7 @@ class DeepseekV4Indexer(nn.Module):
         self.q_lora_rank = q_lora_rank  # 1536
         self.compress_ratio = compress_ratio
         self.use_fp4_kv = self.vllm_config.attention_config.use_fp4_indexer_cache
-        self.use_int8_kv = (
-            cache_config is not None
-            and cache_config.cache_dtype == _INT8_KV_DTYPE
-        )
+        self.use_int8_kv = cache_config.cache_dtype == _INT8_KV_DTYPE
         logger.info_once(
             "Using %s indexer cache for Lighening Indexer.",
             (
@@ -1206,7 +1197,6 @@ class DeepseekV4Indexer(nn.Module):
             get_max_prefill_buffer_size(vllm_config) // self.compress_ratio
         )
 
-        assert cache_config is not None, "Deepseek V4 indexer requires cache_config"
         # NOTE(yifan): FP8 indxer cache use the same layout as V3.2:
         # head_dim bytes = 128 fp8 + 4 fp32 scale = 132.
         # For FP4 indexer cache, we still allocate the same amount of memory as FP8,

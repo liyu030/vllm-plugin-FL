@@ -38,11 +38,22 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.kernels.linear.scaled_mm.BlockScaledMMLinearKernel import (
+    Fp8BlockScaledMMLinearKernel,
+)
 from vllm.model_executor.layers.quantization import (
     QuantizationConfig,
     QuantizationMethods,
 )
-from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.quantization.fp8 import (
+    BlockQuantScaleParameter,
+    Fp8Config,
+    Fp8LinearMethod,
+    create_fp8_scale_parameter,
+    create_fp8_weight_parameter,
+    init_fp8_linear_kernel,
+    validate_fp8_block_shape,
+)
 from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
@@ -66,11 +77,92 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from vllm_fl.ops.metax_quant import metax_fp8_block_gemm
 from vllm_fl.ops.deepseek_v4_attention import (
     DeepseekV4Indexer as DeepseekV4IndexerFP8,
 )
+from vllm_fl.quantization.mxfp4.mxfp4_flaggems import (
+    MetaXDeepseekV4Mxfp4MoEMethod,
+)
 
 _DEEPSEEK_V4_EXPERT_DTYPES = ("bf16", "fp4", "fp8")
+
+
+class MetaXDeepseekV4Fp8LinearKernel(Fp8BlockScaledMMLinearKernel):
+    @classmethod
+    def is_supported(cls, compute_capability=None):
+        return True, None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        replace_parameter(
+            layer, "weight_scale_inv", layer.weight_scale_inv.float()
+        )
+
+    def apply_block_scaled_mm(self, A, B, As, Bs):
+        group_shape = self.config.weight_quant_key.scale.group_shape
+        return metax_fp8_block_gemm(
+            A, B, As, Bs,
+            [group_shape.row, group_shape.col],
+            self.config.out_dtype,
+        )
+
+class MetaXDeepseekV4Fp8LinearMethod(Fp8LinearMethod):
+    def create_weights(
+        self,
+        layer,
+        input_size_per_partition,
+        output_partition_sizes,
+        input_size,
+        output_size,
+        params_dtype,
+        **extra_weight_attrs,
+    ):
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+        layer.orig_dtype = params_dtype
+        layer.weight_block_size = self.weight_block_size
+
+        validate_fp8_block_shape(
+            layer,
+            input_size,
+            output_size,
+            input_size_per_partition,
+            output_partition_sizes,
+            self.weight_block_size,
+        )
+        layer.register_parameter(
+            "weight",
+            create_fp8_weight_parameter(
+                output_size_per_partition,
+                input_size_per_partition,
+                weight_loader,
+            ),
+        )
+        layer.register_parameter(
+            "weight_scale_inv",
+            create_fp8_scale_parameter(
+                BlockQuantScaleParameter,
+                output_partition_sizes,
+                input_size_per_partition,
+                self.weight_block_size,
+                weight_loader,
+                scale_dtype=(
+                    torch.float8_e8m0fnu if self.is_scale_e8m0 else None
+                ),
+            ),
+        )
+        self.fp8_linear = init_fp8_linear_kernel(
+            activation_quant_key=self.activation_quant_key,
+            weight_quant_key=self.weight_quant_key,
+            weight_shape=layer.weight.shape,
+            input_dtype=self.input_dtype,
+            out_dtype=self.out_dtype,
+            force_kernel=MetaXDeepseekV4Fp8LinearKernel,
+            module_name=self.__class__.__name__,
+        )
 
 
 def _torch_post_process_fp8_weight_block_bmm(
@@ -284,7 +376,7 @@ class DeepseekV4FP8Config(Fp8Config):
         if self._resolved_expert_dtype is None:
             try:
                 hf_config = get_current_vllm_config().model_config.hf_config
-            except Exception:
+            except AssertionError:
                 # vllm_config not yet set; defer the decision until a
                 # later call lands inside set_current_vllm_config.
                 return "fp4"
@@ -335,12 +427,20 @@ class DeepseekV4FP8Config(Fp8Config):
             ):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             if self.expert_dtype == "fp4":
+                if current_platform.vendor_name == "metax":
+                    return MetaXDeepseekV4Mxfp4MoEMethod(layer.moe_config)
                 return Mxfp4MoEMethod(layer.moe_config)
             if self.expert_dtype == "bf16":
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             # expert_dtype == "fp8": fall through to Fp8Config which
             # returns Fp8MoEMethod with block-wise float32 scales.
-        return super().get_quant_method(layer, prefix)
+        quant_method = super().get_quant_method(layer, prefix)
+        if (
+            current_platform.vendor_name == "metax"
+            and isinstance(quant_method, Fp8LinearMethod)
+        ):
+            return MetaXDeepseekV4Fp8LinearMethod(self)
+        return quant_method
 
     def is_mxfp4_quant(self, prefix, layer):
         return isinstance(layer, FusedMoE) and self.expert_dtype == "fp4"

@@ -1,12 +1,10 @@
 # Copyright (c) 2025 BAAI. All rights reserved.
 # Adapted from vllm/model_executor/layers/fused_moe/layer.py (v0.20.2)
 
+import torch
 import inspect
 
-import torch
-
 from vllm.model_executor.layers.fused_moe import FusedMoE
-from vllm.platforms import current_platform
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
     MoERunner,
 )
@@ -38,17 +36,6 @@ from vllm.model_executor.layers.fused_moe.config import (
 from .fused_moe_utils import select_unquantized_moe_backend_oot
 from .mxfp4_selector import select_fixed_mxfp4_method
 from vllm_fl.quantization.mxfp4.mxfp4_marlin import MarlinExpertsFL
-
-if current_platform.vendor_name == "metax":
-    import vllm.model_executor.layers.quantization.mxfp4 as _upstream_mxfp4
-    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend
-    from vllm_fl.quantization.mxfp4.mxfp4_flaggems import FlagGemsMxfp4Experts
-
-    def _select_metax_mxfp4_backend(_moe):
-        return Mxfp4MoeBackend.MARLIN, FlagGemsMxfp4Experts
-
-    _upstream_mxfp4.select_mxfp4_moe_backend = _select_metax_mxfp4_backend
-
 
 class UnquantizedFusedMoEMethodFL(UnquantizedFusedMoEMethod):
     """OOT replacement for UnquantizedFusedMoEMethod that routes computation through flaggems."""

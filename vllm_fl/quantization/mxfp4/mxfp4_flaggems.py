@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import torch
-from vllm.platforms import current_platform
+from vllm.config import get_current_vllm_config
 from vllm_fl.ops.metax_quant import metax_mxfp4_gemm
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -27,43 +27,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp4Static,
 )
 
-
-def _metax_mxfp4_moe(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    w1_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    apply_router_weight_on_input: bool,
-) -> torch.Tensor:
-    output = torch.zeros_like(hidden_states)
-    for expert in torch.unique(topk_ids).tolist():
-        routes = (topk_ids == expert).nonzero(as_tuple=False)
-        token_ids = routes[:, 0]
-        route_slots = routes[:, 1]
-        route_weights = topk_weights[token_ids, route_slots].to(hidden_states.dtype)
-        expert_input = hidden_states[token_ids]
-        if apply_router_weight_on_input:
-            expert_input = expert_input * route_weights.unsqueeze(-1)
-
-        gate_up = metax_mxfp4_gemm(
-            expert_input, w1[expert], w1_scale[expert]
-        )
-        gate, up = gate_up.chunk(2, dim=-1)
-        intermediate = torch.nn.functional.silu(gate) * up
-        expert_output = metax_mxfp4_gemm(
-            intermediate, w2[expert], w2_scale[expert]
-        )
-        if not apply_router_weight_on_input:
-            expert_output = expert_output * route_weights.unsqueeze(-1)
-        # Top-k routing selects each expert at most once per token. Advanced
-        # indexing avoids FlagGems' Triton index_add kernel on MetaX.
-        output[token_ids] = output[token_ids] + expert_output
-    return output
-
-
 class FlagGemsMxfp4Experts(mk.FusedMoEExpertsModular):
     """FlagGems MXFP4 experts consuming checkpoint-native uint8 weights."""
 
@@ -73,9 +36,9 @@ class FlagGemsMxfp4Experts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_current_device() -> bool:
-        return torch.cuda.is_available() and (
-            current_platform.vendor_name == "metax"
-            or torch.cuda.get_device_capability()[0] >= 9
+        return (
+            torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] >= 9
         )
 
     @staticmethod
@@ -161,35 +124,70 @@ class FlagGemsMxfp4Experts(mk.FusedMoEExpertsModular):
             )
         assert self.w1_scale is not None and self.w2_scale is not None
 
-        if current_platform.vendor_name == "metax":
-            result = _metax_mxfp4_moe(
-                hidden_states,
-                w1,
-                w2,
-                self.w1_scale,
-                self.w2_scale,
-                topk_weights,
-                topk_ids,
-                apply_router_weight_on_input,
-            )
-        else:
-            from flag_gems.fused.fused_marlin_moe import fused_moe_mxfp4
+        from flag_gems.fused.fused_marlin_moe import fused_moe_mxfp4
 
-            result = fused_moe_mxfp4(
-                hidden_states=hidden_states,
-                w1=w1,
-                w2=w2,
-                w1_scale=self.w1_scale,
-                w2_scale=self.w2_scale,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                activation="silu",
-                group_size=32,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                inplace=False,
-            )
+        result = fused_moe_mxfp4(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            w1_scale=self.w1_scale,
+            w2_scale=self.w2_scale,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation="silu",
+            group_size=32,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            inplace=False,
+        )
         output.copy_(result)
 
+
+class MetaXDeepseekV4Mxfp4Experts(FlagGemsMxfp4Experts):
+    @staticmethod
+    def _supports_current_device() -> bool:
+        return torch.cuda.is_available()
+
+    def apply(
+        self,
+        output,
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        activation,
+        global_num_experts,
+        expert_map,
+        a1q_scale,
+        a2_scale,
+        workspace13,
+        workspace2,
+        expert_tokens_meta,
+        apply_router_weight_on_input,
+    ) -> None:
+        output.zero_()
+        for expert in torch.unique(topk_ids).tolist():
+            routes = (topk_ids == expert).nonzero(as_tuple=False)
+            token_ids = routes[:, 0]
+            route_slots = routes[:, 1]
+            route_weights = topk_weights[token_ids, route_slots].to(
+                hidden_states.dtype
+            )
+            expert_input = hidden_states[token_ids]
+            if apply_router_weight_on_input:
+                expert_input = expert_input * route_weights.unsqueeze(-1)
+
+            gate_up = metax_mxfp4_gemm(
+                expert_input, w1[expert], self.w1_scale[expert]
+            )
+            gate, up = gate_up.chunk(2, dim=-1)
+            intermediate = torch.nn.functional.silu(gate) * up
+            expert_output = metax_mxfp4_gemm(
+                intermediate, w2[expert], self.w2_scale[expert]
+            )
+            if not apply_router_weight_on_input:
+                expert_output = expert_output * route_weights.unsqueeze(-1)
+            output[token_ids] = output[token_ids] + expert_output
 
 class FlagGemsMxfp4MoEMethod(Mxfp4MoEMethod):
     """MXFP4 method that deliberately skips Marlin weight conversion."""
@@ -234,13 +232,51 @@ class FlagGemsMxfp4MoEMethod(Mxfp4MoEMethod):
         )
 
 
+class MetaXDeepseekV4Mxfp4MoEMethod(FlagGemsMxfp4MoEMethod):
+    def __init__(self, moe: FusedMoEConfig):
+        # Skip Mxfp4MoEMethod.__init__, which invokes the global backend selector.
+        super(Mxfp4MoEMethod, self).__init__(moe)
+        self.weight_dtype = "mxfp4"
+        self.mxfp4_backend = Mxfp4MoeBackend.MARLIN
+        self.experts_cls = MetaXDeepseekV4Mxfp4Experts
+        self.max_capture_size = (
+            get_current_vllm_config().compilation_config.max_cudagraph_capture_size
+        )
+        self._cache_permute_indices = {}
+        self.moe_kernel = None
+        self.w13_precision_config = None
+        self.w2_precision_config = None
+
+    def _setup_kernel(
+        self,
+        layer,
+        w13,
+        w2,
+        w13_scale,
+        w2_scale,
+        w13_bias=None,
+        w2_bias=None,
+    ) -> None:
+        self.moe_quant_config = mxfp4_w4a16_moe_quant_config(
+            w1_scale=w13_scale,
+            w2_scale=w2_scale,
+            w1_bias=w13_bias,
+            w2_bias=w2_bias,
+            gemm1_clamp_limit=getattr(layer, "swiglu_limit", None),
+        )
+        self.moe_kernel = make_mxfp4_moe_kernel(
+            moe_quant_config=self.moe_quant_config,
+            moe_config=self.moe,
+            mxfp4_backend=Mxfp4MoeBackend.MARLIN,
+            experts_cls=MetaXDeepseekV4Mxfp4Experts,
+            routing_tables=layer._maybe_init_expert_routing_tables(),
+            shared_experts=layer.shared_experts,
+        )
+
 def flaggems_mxfp4_compatible(moe: FusedMoEConfig) -> bool:
     return (
         torch.cuda.is_available()
-        and (
-            current_platform.vendor_name == "metax"
-            or torch.cuda.get_device_capability()[0] >= 9
-        )
+        and torch.cuda.get_device_capability()[0] >= 9
         and moe.in_dtype in (torch.float16, torch.bfloat16)
         and moe.activation == MoEActivation.SILU
         and not moe.has_bias
